@@ -1,0 +1,2182 @@
+---
+title: "STAT578 Final Project"
+author: "Wei Chen Lin"
+date: "May 02, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(warn = 1)
+```
+```{r function defs, echo=FALSE, message=FALSE, warning=FALSE}
+  scale_0_to_1 <- function(data, scale_cols) {
+#    
+    scales <- as.data.frame(matrix(0, ncol = 2))
+#    
+    for (i in 1:length(scale_cols)) {
+      scales[i, 1] <- 
+        max(data[, scale_cols[i]], na.rm = TRUE) -
+        min(data[, scale_cols[i]], na.rm = TRUE)
+      scales[i, 2] <- 
+        min(data[, scale_cols[i]], na.rm = TRUE)
+    }
+    data[, scale_cols] <- 
+      scale(data[, scale_cols], 
+            center = scales[, 2], 
+            scale = scales[, 1]) %>%
+      as.data.frame()
+    return(data)
+  }
+```
+
+```{r libraries, echo=FALSE, message=FALSE, warning=FALSE}
+#
+# load needed libraries ----
+#
+# dplyr provides pipes etc.
+#
+  library(dplyr)
+#
+  library(tidyverse)
+#
+# ggthemes gives us ggplot themes
+#
+  library(ggthemes)
+#
+# gridExtra allows arraning multiple ggplots
+#
+  library(gridExtra)
+#
+# reshape2 provies melt and cast
+#
+  library(reshape2)
+#
+# scales formats dollars etc. in plots
+#
+  library(scales)
+#
+# keras provides access to TensorFlow NN modeling
+#
+  library(keras)
+#
+# caret gives us the trainControl method and resampling
+#
+  library(caret)
+#
+# glmnet provides ridge, lasso, and elastic net regression
+#
+  library(glmnet)
+#
+  library(forecast)
+#
+  library(tseries)
+```
+
+
+```{r Pipeline Data, echo=FALSE, message=FALSE, warning=FALSE}
+  pipeline <- 
+    read.csv("pipeline_data.csv",
+             header = TRUE,
+             stringsAsFactors = FALSE) %>%
+    mutate(Date = as.Date(Date, format = '%m/%d/%Y')) %>%
+    scale_0_to_1(scale_cols = which(colnames(.) != "Date"))
+  melted_pipeline <- pipeline[, c(1, 2)]
+  melted_pipeline[, 3] <- rep(colnames(pipeline)[2], 
+                              nrow(pipeline))
+  colnames(melted_pipeline) <- c("date", "pipeline", "product")
+  for (i in 3:ncol(pipeline)) {
+    melted_temp <- pipeline[, c(1, i)]
+    melted_temp[, 3] <- rep(colnames(pipeline)[i],
+                            nrow(pipeline))
+    colnames(melted_temp) <- c("date", "pipeline", "product")
+    melted_pipeline <-
+      rbind(melted_pipeline, melted_temp)
+  }
+  melted_pipeline %>%
+    filter(product != "Total") %>%
+    ggplot(aes(x = date, 
+               y = pipeline, 
+               group = product, 
+               color = product)) +
+    geom_line() +
+    theme_bw() +
+    labs(x = "",
+         y = "Pipeline (normalized)\n",
+         title = "Open Sales Pipeline") +
+    theme(legend.position = "right") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    geom_vline(xintercept = as.Date(c('2013-01-01',
+                                      '2014-01-01',
+                                      '2015-01-01',
+                                      '2016-01-01')),
+               size = 0.25,
+               color = "black")
+```
+
+
+```{r Pipeline Data (filtered), echo=FALSE, message=FALSE, warning=FALSE}
+  exclude_pipelines <-
+    c("GP", "Repl", "Spec_3", "Spec_2")
+  melted_pipeline %>%
+    filter(!(product %in% exclude_pipelines)) %>%
+    filter(product != "Total") %>%
+    ggplot(aes(x = date, 
+               y = pipeline, 
+               group = product, 
+               color = product)) +
+    geom_line() +
+    theme_bw() +
+    labs(x = "",
+         y = "Pipeline (normalized)\n",
+         title = "Open Sales Pipeline") +
+    theme(legend.position = "right") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+
+```{r raw and MA data, echo=FALSE, message=FALSE, warning=FALSE}
+  raw_data <- 
+    read.csv('raw_and_MA_sales.csv', 
+             header = TRUE,
+             stringsAsFactors = FALSE) %>%
+    mutate(uniform_date = as.Date(uniform_date, 
+                                  format = '%m/%d/%Y')) %>%
+    mutate(raw_sales = case_when(
+      is.na(raw_sales) ~ 0,
+      TRUE ~ raw_sales
+    )) %>%
+    scale_0_to_1(which(!(colnames(.) %in% 
+                           c("uniform_date"))))
+#  
+  raw_data %>%
+    ggplot(aes(x = uniform_date, 
+               y = raw_sales)) +
+    geom_point(color = "red", shape = 21, size = 3) +
+    labs(x = "Sales Date", 
+         y = "Sales (normalized)\n",
+         title = "Raw Sales Data") +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5, size = 12))
+#
+```
+
+
+```{r Smoothed Sales, echo=FALSE, message=FALSE, warning=FALSE}
+  raw_data %>%
+    ggplot(aes(x = uniform_date, 
+               y = X21_d_MA)) +
+    geom_line(color = "red") +
+    labs(x = "Sales Date", 
+         y = "Sales (normalized)\n",
+         title = "Total Sales",
+         subtitle = "21-day moving average") +
+    theme_bw() +
+    theme(legend.position = "right") +
+    theme(plot.title = element_text(hjust = 0.5, size = 12)) +
+    theme(plot.subtitle = element_text(hjust = 0.5))
+#
+```
+
+
+# -------------------------------------------
+# DFT
+# -------------------------------------------
+
+```{r visualize sin/cos, echo=FALSE, message=FALSE, warning=FALSE}
+  DFT_results <- 
+    raw_data %>%
+    select(uniform_date, X21_d_MA) %>%
+    mutate(day = as.integer(uniform_date)) %>%
+    mutate(sin_512 = sin(2 * pi * (1 / 1875) * day)) %>%
+  mutate(cos_512 = cos(2 * pi * (1 / 1875) * day)) %>%
+  mutate(sin_365 = sin(2 * pi * (1 / 938) * day)) %>%
+  mutate(cos_365 = cos(2 * pi * (1 / 938) * day)) %>%
+  mutate(sin_183 = sin(2 * pi * (1 / 625)* day)) %>%
+  mutate(cos_183 = cos(2 * pi * (1 / 625) * day)) %>%
+  mutate(sin_91 = sin(2 * pi * (1 / 375) * day)) %>%
+  mutate(cos_91 = cos(2 * pi * (1 / 375) * day)) %>%
+  mutate(sin_30 = sin(2 * pi * (1 / 187) * day)) %>%
+  mutate(cos_30 = cos(2 * pi * (1 / 187) * day))
+
+  DFT_fit <- 
+    lm(X21_d_MA ~ . - uniform_date, data = DFT_results)
+  
+  DFT_results %>%
+    mutate(fit = predict(DFT_fit)) %>%
+    ggplot(aes(x = uniform_date, y = X21_d_MA)) +
+    geom_line(color = "red", size = 0.5) +
+    geom_line(aes(x = uniform_date, y = fit),
+              color = "dodgerblue", size = 0.5) +
+    labs(x = "", 
+         y = "Sales / fit (normalized)\n",
+         title = "DFT analysis",
+         subtitle = "Sales with DFT fit overlay") +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(plot.subtitle = element_text(hjust = 0.5))
+#  
+```
+
+
+# -------------------------------------------
+# Autocorrelation
+# -------------------------------------------
+
+```{r Basic Autocorrelation, echo=FALSE, message=FALSE, warning=FALSE}
+  acf(x = raw_data[, "X21_d_MA"],
+      plot = TRUE,
+      main = "Autocorrelation of Sales\n(moving average)")
+```
+
+
+```{r Autocorrelation Analysis, echo=FALSE, message=FALSE, warning=FALSE}
+  acf(x = raw_data[, "X21_d_MA"],
+      plot = TRUE,
+      lag.max = 395,
+      xlim = c(0, 395),
+      col = adjustcolor("dodgerblue", alpha = 0.5),
+      main = "Autocorrelation of Sales")
+```
+
+
+```{r Investigate Long Lags, echo=FALSE, message=FALSE, warning=FALSE}
+
+# in raw_data, the sales is in moving average form (21 days)
+  raw_sales_clean <- 
+    raw_data %>%
+    mutate(week = as.integer(format(uniform_date, 
+                                    format = "%V"))) %>%
+    mutate(year = as.integer(format(uniform_date,
+                                    format = "%Y"))) %>%
+    mutate(serial_week = year * 100 + week) %>%
+    group_by(serial_week) %>%
+    summarize(weekly_sales = sum(raw_sales, na.rm = TRUE)) %>%
+    select(weekly_sales)
+
+  acf(x = raw_sales_clean,
+      plot = TRUE,
+      lag.max = 56,
+      xlim = c(0, 56),
+      main = "Autocorrelation of sales\n(raw data)")
+  
+```
+
+# use one year lagged to make prediction on the next six-month sales
+# only use the X21_d_MA itself (time series)
+
+# I will predict the Sales figures with the 365-day lagged sales to do a preliminary validation that using such a long lag is useful
+
+```{r Prelim Fit to Autocorr, echo=FALSE, method=FALSE, fig.width=9}
+  test_fit <- 
+    raw_data %>%
+    select(uniform_date, X21_d_MA) %>%
+    rename(lagged_sales = X21_d_MA) %>%
+    mutate(serial_date = as.integer(uniform_date) + 365)
+
+  test_fit <-  
+    raw_data %>%
+    select(uniform_date, X21_d_MA) %>%
+    rename(orig_sales = X21_d_MA) %>%
+    mutate(serial_date = as.integer(uniform_date)) %>%
+    full_join(test_fit, by = "serial_date") %>%
+    select(serial_date, lagged_sales, orig_sales) %>%
+    rename(Date = serial_date) %>%
+    mutate(Date = as.Date(Date, origin = '1970-01-01')) %>%
+    filter(!(is.na(lagged_sales)) &
+           !(is.na(orig_sales)) &
+           !(is.na(Date)))
+  
+  source_plot <-
+    test_fit %>%
+    ggplot(aes(x = Date, 
+               y = lagged_sales, 
+               color = "black")) +
+    geom_line() +
+    geom_line(aes(x = Date,
+                  y = orig_sales, 
+                  color = "red")) +
+    theme_bw() +
+    labs(x = "",
+         y = "Sales\n",
+         title = "Lagged Sales",
+         subtitle = "overlay on Sales") +
+    scale_color_manual("Data source",
+                       values = c("dodgerblue", "red"),
+                       labels = c("lagged", "original")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(plot.subtitle = element_text(hjust = 0.5)) +
+    theme(legend.position = "right")
+#  
+  test_model <-
+    lm(orig_sales ~ lagged_sales, data = test_fit)
+  
+  test_fit <-
+    test_fit %>%
+    mutate(pred = predict(test_model)) %>%
+    mutate(res = pred - orig_sales)
+#
+  pred_plot <-
+    test_fit %>%
+    ggplot(aes(x = Date)) +
+    geom_line(aes(y = orig_sales,
+               color = "original")) +
+    geom_line(aes(y = pred,
+                  color = "model")) +
+    theme_bw() +
+    labs(x = "",
+         y = "Model / Sales\n",
+         title = "Prediction using Lagged Sales",
+         subtitle = "overlay on Sales") +
+    scale_color_manual("Data Source",
+                       values = c("original" = "red",
+                                  "model" = "dodgerblue")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(plot.subtitle = element_text(hjust = 0.5)) +
+    theme(legend.position = "right") +
+    ylim(0, 1)
+  grid.arrange(source_plot, pred_plot, ncol = 2)
+#
+```
+
+# from the residual distribution below, we can prove that one-year lagged price can be used to make prediction
+
+# So, all the features will be lagged for one year later
+
+# I think it is because that the price is affected by all the features. If we find that price itself have an one-year autocorrelation. It's reasonable to lag the features.
+
+
+```{r Lagged Fit Residuals, echo=FALSE, message=FALSE, warning=FALSE}
+  mean_res <- mean(test_fit[, "res"])
+  sd_res <- sd(test_fit[, "res"])
+  norm_curve_x <- 
+    seq(-1, 1, length.out = nrow(test_fit))
+  test_fit_density <-
+    dnorm(norm_curve_x,
+          mean = mean_res,
+          sd = sd_res)
+  density_scale <- max(test_fit_density)
+  test_fit_density <- 
+    test_fit_density / density_scale
+  test_fit_hist <-
+    test_fit %>%
+    ggplot(aes(x = res)) +
+    geom_density(aes(y = ..scaled..),
+                 fill = "dodgerblue", 
+                 color = "blue",
+                 alpha = 0.5) +
+    theme_bw() +
+    xlim(-0.75, 0.75) +
+    labs(x = "Normalized Residual",
+         y = "Normalized Density\n", 
+         title = "Distribution of Residuals",
+         subtitle = "linear fit to lagged Sales") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(plot.subtitle = element_text(hjust = 0.5))
+#
+  test_fit_hist <-
+    test_fit_hist +
+    geom_line(aes(x = norm_curve_x, 
+                  y = test_fit_density), 
+              color = "red", 
+              size = 1)
+  print(test_fit_hist)
+#  
+```
+
+# -------------------------------------------
+# Externel features
+# -------------------------------------------
+
+```{r Commodity Data, echo=FALSE, message=FALSE, warning=FALSE}
+ commodity <- read.csv('commodity_pricing.csv', 
+             header = TRUE,
+             stringsAsFactors = FALSE) %>%
+    mutate(date = as.Date(date,
+                          origin = '1899-12-30'))
+
+  scale_cols <- which(colnames(commodity) != "date")
+  
+  commodity <- commodity %>%
+    filter(date >= '2011-01-01') %>%
+    scale_0_to_1(scale_cols)
+  
+#  
+  commodity %>%
+    ggplot(aes(x = date, y = commodity_price,
+               color = "Commodity")) +
+    geom_line() +
+    labs(x = "Date", 
+          y = "Commodity / Sales (normalized)\n",
+          title = "Commodity Trend",
+          subtitle = "overlay on Sales") +
+    
+    # smooth the raw_data (MA21)
+    geom_smooth(data = raw_data, 
+          aes(x = uniform_date,
+              y = X21_d_MA,
+              color = "Sales"),
+          size = 0.5,
+          se = FALSE,
+          method = "loess",
+          span = 0.08) +
+    theme_bw() +
+    scale_color_manual("",
+                       values = c("dodgerblue", "red"),
+                       breaks = c("Commodity", "Sales")) +
+    theme(legend.position = "right") +
+    theme(plot.title = element_text(hjust = 0.5, size = 12)) +
+    theme(plot.subtitle = element_text(hjust = 0.5))
+#  
+```
+
+
+
+
+# compare the lag time by looking at the rmse (linear regression - commodity price + date)
+```{r Teset Commodity Lags, echo=FALSE, message=FALSE, warning=FALSE}
+#
+# explore lags up to two years and test residuals
+#
+  test_RMSEs <- data.frame(lag = integer(),
+                           RMSE = numeric())
+  mean_lin_RMSE <- 0
+  i <- 0
+  
+  # lagged by month
+  for (com_offset in seq(0, 730, 30)) {
+    
+    test_cor <- commodity %>%
+      mutate(uniform_date = date + com_offset) %>%
+      full_join(raw_data, by = "uniform_date") %>%
+      select(X21_d_MA, uniform_date, commodity_price) %>%
+      rename(date = uniform_date)
+    
+    # remove NA
+    test_cor <- test_cor[!(is.na(test_cor[, "X21_d_MA"])) & !(is.na(test_cor[, "commodity_price"])), ]
+    
+    # linear model with only one features - date
+    linear_fit <- lm(X21_d_MA ~ date, data = test_cor)
+    
+    # calculate rmse
+    linear_RMSE <- sqrt(sum((predict(linear_fit) - test_cor[, "X21_d_MA"])^2) / nrow(test_cor))
+    
+    # update mean rmse
+    mean_lin_RMSE <- mean_lin_RMSE + linear_RMSE
+    
+    # linear model with lagged commodity price
+    com_fit <- lm(X21_d_MA ~ commodity_price, data = test_cor)
+    
+    # rmse
+    com_RMSE <- sqrt(sum((predict(com_fit) - test_cor[, "X21_d_MA"])^2) / nrow(test_cor))
+    
+    # linear model with lagged commodity price and date
+    both_fit <- lm(X21_d_MA ~ commodity_price + date, data = test_cor)
+    
+    # rmse
+    both_RMSE <- sqrt(sum((predict(both_fit) - test_cor[, "X21_d_MA"])^2) / nrow(test_cor))
+    
+    # put the rmse into the table
+    i <- i + 1
+    test_RMSEs[i, "lag"] <- com_offset
+    test_RMSEs[i, "RMSE"] <- both_RMSE
+  }
+  
+  mean_lin_RMSE <- mean_lin_RMSE / i
+  com_offset <- test_RMSEs[which(test_RMSEs[, "RMSE"] == min(test_RMSEs[, "RMSE"])), "lag"]
+
+  test_RMSEs %>%
+    ggplot(aes(x = lag, y = RMSE)) +
+    geom_line(color = "black") +
+    theme_bw() +
+    labs(x = "Days commodity price leads Sales",
+         y = "RMSE of fit\n",
+         title = "RMSE of fit vs. lag",
+         subtitle = "Sales vs. (time + commmodity price)") +
+    geom_vline(xintercept = com_offset, color = 'red') +
+    geom_text(aes(x = 102, y = 0.116, label = 90), color = 'red') +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(plot.subtitle = element_text(hjust = 0.5)) +
+    geom_hline(yintercept = mean_lin_RMSE, color = "red") +
+    annotate("text",
+             x = 10, 
+             y = mean_lin_RMSE + 
+               0.03 * (max(test_RMSEs[, "RMSE"]) - 
+                         min(test_RMSEs[, "RMSE"])), 
+             label = "RMSE for linear fit only", 
+             color = "red",
+             hjust = 0)
+```
+
+# above plot shows that it takes 90 days for commodity price influencing the MA21 
+
+
+# the dips are closer from the above plot
+```{r lag and scale, echo=FALSE, message = FALSE}
+  commodity %>%
+    filter(date + com_offset < '2017-01-01') %>%
+    ggplot(aes(x = date + com_offset, y = commodity_price,
+               color = "Commodity")) +
+    geom_line() +
+    labs(x = "Date", 
+          y = "Commodity / Sales (normalized)\n",
+          title = "Lagged Commodity Trend",
+          subtitle = "overlay on Sales") +
+    geom_smooth(data = raw_data, 
+          aes(x = uniform_date,
+              y = X21_d_MA,
+              color = "Sales"),
+          size = 0.5,
+          se = FALSE,
+          method = "loess",
+          span = 0.08) +
+    theme_bw() +
+    scale_color_manual("",
+                       values = c("dodgerblue", "red"),
+                       breaks = c("Commodity", "Sales")) +
+    theme(legend.position = "right") +
+    theme(plot.title = element_text(hjust = 0.5, size = 12)) +
+    theme(plot.subtitle = element_text(hjust = 0.5))
+#  
+```  
+
+
+# rmse distribtion plot
+```{r test final offset, echo=FALSE, message=FALSE, warning=FALSE}
+  test_cor <- 
+    commodity %>%
+    mutate(uniform_date = date + com_offset) %>%
+    full_join(raw_data, by = "uniform_date") %>%
+    select(X21_d_MA, uniform_date, commodity_price) %>%
+    rename(date = uniform_date)
+  test_cor <- test_cor[!(is.na(test_cor[, "X21_d_MA"])) &
+                         !(is.na(test_cor[, "commodity_price"])), ]
+  linear_fit <- 
+    lm(X21_d_MA ~ date, data = test_cor)
+  linear_RMSE <- 
+    sqrt(sum((predict(linear_fit) - 
+                test_cor[, "X21_d_MA"])^2) / nrow(test_cor))
+  com_fit <- 
+    lm(X21_d_MA ~ commodity_price, data = test_cor)
+  com_RMSE <-
+    sqrt(sum((predict(com_fit) -
+                test_cor[, "X21_d_MA"])^2) / nrow(test_cor))
+  both_fit <- 
+    lm(X21_d_MA ~ commodity_price + date, data = test_cor)
+  both_RMSE <-
+    sqrt(sum((predict(both_fit) -
+                test_cor[, "X21_d_MA"])^2) / nrow(test_cor))
+  test_cor <- 
+    test_cor %>%
+    mutate(linear_fit = predict(linear_fit)) %>%
+    mutate(linear_res = linear_fit - X21_d_MA) %>%
+    mutate(com_fit = predict(com_fit)) %>%
+    mutate(com_res = com_fit - X21_d_MA) %>%
+    mutate(both_fit = predict(both_fit)) %>%
+    mutate(both_res = both_fit - X21_d_MA)     
+  lin_res_sd <- sd(test_cor[, "linear_res"])
+  lin_res_mean <- mean(test_cor[, "linear_res"])
+  com_res_sd <- sd(test_cor[, "com_res"])
+  com_res_mean <- mean(test_cor[, "com_res"])
+  both_res_sd <- sd(test_cor[, "both_res"])
+  both_res_mean <- mean(test_cor[, "both_res"])
+  xlim <- c(-0.75, 0.75)
+  ylim <- c(0, 6)
+  linear_hist <-
+    test_cor %>%
+    ggplot(aes(x = linear_res)) +
+    geom_density(stat = "density", 
+                   fill = "blue",
+                   color = "lightyellow",
+                   alpha = 0.3) +
+    xlim(xlim) +
+    ylim(ylim) +
+    labs(title = "\n(linear fit)",
+         x = "") +
+    theme(plot.title = element_text(hjust = 0.5, size = 10))
+  centers <- 
+    test_cor[, "linear_res"]
+  density <-
+    dnorm(centers, mean = lin_res_mean, sd = lin_res_sd)
+  linear_hist <-
+    linear_hist +
+    geom_line(aes(x = centers, y = density), 
+              color = "red", 
+              size = 1)
+  com_hist <-
+    test_cor %>%
+    ggplot(aes(x = com_res)) +
+    geom_density(stat = "density", 
+                   fill = "red",
+                   color = "lightyellow",
+                   alpha = 0.3) +
+    xlim(xlim) +
+    ylim(ylim) +
+    labs(title = "Residuals\n(fit to commodity)",
+         x = "", 
+         y = "") +
+    theme(plot.title = element_text(hjust = 0.5, size = 10))
+  centers <- 
+    test_cor[, "com_res"]
+  density <-
+    dnorm(centers, mean = com_res_mean, sd = com_res_sd)
+  com_hist <-
+    com_hist +
+    geom_line(aes(x = centers, y = density), 
+              color = "red", 
+              size = 1)
+  both_hist <-
+    test_cor %>%
+    ggplot(aes(x = both_res)) +
+    geom_density(stat = "density", 
+                 fill = "purple",
+                 color = "lightyellow",
+                 alpha = 0.75) +
+    xlim(xlim) +
+    ylim(ylim) +
+    labs(title = "\n(fit to both)",
+         x = "", 
+         y = "") +
+    theme(plot.title = element_text(hjust = 0.5, size = 10))
+  centers <- 
+    test_cor[, "both_res"]
+  density <-
+    dnorm(centers, mean = both_res_mean, sd = both_res_sd)
+  both_hist <-
+    both_hist +
+    geom_line(aes(x = centers, y = density), 
+              color = "red", 
+              size = 1)
+  grid.arrange(linear_hist, com_hist, both_hist, ncol = 3)
+#
+```
+
+
+
+
+# -------------------------------------------
+# market level indicator
+# -------------------------------------------
+
+# look for other market or external factors that might explain some of the observed cyclical behaviors
+
+```{r Economic Activity, echo=FALSE, message=FALSE, warning=FALSE}
+  econ_index <- read.csv('economic_index.csv',
+                         header = TRUE,
+                         stringsAsFactors = FALSE) %>%
+    mutate(date = as.Date(date, format = '%m/%d/%Y')) %>%
+    rename(Date = date) %>%
+    filter(Date >= '2012-01-01' & 
+             Date <= '2016-12-31')
+
+  scale_cols <- which(colnames(econ_index) != "Date")
+  
+  econ_index <- scale_0_to_1(econ_index, scale_cols)
+  
+  econ_index %>%
+    ggplot(aes(x = Date, y = index)) +
+    geom_line(color = "black", size = 0.5) +
+    theme_bw() +
+    labs(x = "",
+         y = "index (normalized)\n",
+         title = "Raw econonic index") +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+#correlation analysis to find the lag between these data and the sales data, arriving at 1440 days
+# linear regression method
+
+# cross correlation method
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+ccf_result1 <-
+  ccf(econ_index$index, raw_data$X21_d_MA, lag.max = 365, type = 'correlation')
+
+# extract the maximum ccf
+max_cor1 <- cbind(
+  lag = ccf_result1[["lag"]], 
+  ccf = ccf_result1[["acf"]]
+) %>%
+  as.data.frame()
+
+max_ccf1 <- which(max_cor1[, "ccf"] == max(max_cor1[, "ccf"]))
+zero_lag1 <- which(max_cor1[, "lag"] == 0)
+
+
+as.integer(econ_index[max_ccf1, "Date"] - econ_index[zero_lag1, "Date"])
+
+```
+
+
+```{r apply known lag, echo=FALSE, message=FALSE, warning=FALSE}
+#
+# compare with offset
+#
+  econ_offset <- 331
+  econ_index %>%
+    ggplot(aes(x = Date + econ_offset, y = index)) +
+    geom_line(color = "black", size = 0.5) +
+    geom_line(data = raw_data, aes(x = uniform_date, 
+                                   y = X21_d_MA),
+              color = "red") +
+    theme_bw() +
+    labs(x = "",
+         y = "index / Sales (normalized)\n",
+         title = "Lagged econonic index",
+         subtitle = "overlay on Sales") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(plot.subtitle = element_text(hjust = 0.5))
+  
+#
+```
+
+# -------------------------------------------
+# Equipment order
+# -------------------------------------------
+
+
+# convert the raw_data into monthly data
+```{r Mfg. Equip. Orders, echo=FALSE, message=FALSE, warning=FALSE}
+  ind_orders <-
+    read.csv("Manufacturing_Equipment_Orders.csv",
+             header = TRUE,
+             stringsAsFactors = FALSE) %>%
+    mutate(Date = as.Date(Date, format = '%m/%d/%Y'))
+#
+  scale_cols <- which(colnames(ind_orders) != "Date")
+  ind_orders <- scale_0_to_1(ind_orders, scale_cols)
+#
+# investigate cross correlation
+#
+# we need to build monthly data at month end
+# from the sales data to match the equipment orders data
+# in order to use the ccf function
+#
+  test_ccf <-
+    raw_data %>%
+    mutate(Month = 
+             as.integer(substr(as.character(uniform_date), 6, 7))) %>%
+    mutate(Year = 
+             as.integer(substr(as.character(uniform_date), 1, 4))) %>%
+    mutate(Year = case_when(
+      Month < 12 ~ as.integer(Year),
+      Month == 12 ~ as.integer(Year + 1)
+    )) %>%
+    mutate(Month = case_when(
+      Month < 12 ~ as.integer(Month + 1),
+      Month == 12 ~ as.integer(1)
+    )) %>%
+    mutate(month_date = as.Date(paste0(Year, "-", Month, "-01"))) %>%
+    select(month_date, X21_d_MA) %>%
+    mutate(Date = as.Date(month_date - 1)) %>%
+    group_by(Date) %>%
+    summarise(monthly_sales = sum(X21_d_MA)) %>%
+    full_join(ind_orders, by = "Date") %>%
+    filter(!(is.na(Date)) &
+             !(is.na(monthly_sales)) &
+             !(is.na(Orders))) %>%
+    mutate(monthly_sales = monthly_sales - predict(lm(monthly_sales ~ Date, data = (.)))) %>%
+    scale_0_to_1(which(colnames(.) == "monthly_sales"))
+#
+# visualize the two monthly series together
+#
+  test_ccf %>%
+    ggplot(aes(x = Date, y = Orders + 1)) +
+    geom_line(color = "black", size = 0.5) +
+    geom_line(aes(x = Date, y = monthly_sales),
+              color = "red") +
+    theme_bw() +
+    labs(x = "",
+         y = "Mfg. Equip. Orders / Sales (normalized)\n",
+         title = "Manufacturing Equipment Orders",
+         subtitle = "overlay on Sales") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(plot.subtitle = element_text(hjust = 0.5))
+```
+
+# I ran a cross correlation analysis between the monthly series, as seen below.  The strongest correlation occurs at 13 months, or 393 days.
+
+```{r perform cross correlaiton, echo=FALSE, message=FALSE, warning=FALSE}
+#  
+# now get the cross correlation results
+#
+    ccf_result <-
+      ccf(test_ccf[, "monthly_sales"], 
+          test_ccf[, "Orders"], 
+          lag.max = 24,
+          type = "correlation",
+          plot = TRUE,
+          main = "Time equipment orders change before Sales\n(months)")
+
+    # extract the maximum ccf
+    max_cor <- cbind(
+      lag = ccf_result[["lag"]], 
+      ccf = ccf_result[["acf"]]
+      ) %>%
+      as.data.frame()
+    
+    max_ccf <- which(max_cor[, "ccf"] == max(max_cor[, "ccf"]))
+    zero_lag <- which(max_cor[, "lag"] == 0)
+    
+    ind_orders_offset <- as.integer(test_ccf[max_ccf, "Date"] - test_ccf[zero_lag, "Date"])
+```
+
+
+
+```{r visualize lagged data, echo=FALSE, message=FALSE, warning=FALSE}
+#  
+# now we'll compare over the date range of interest
+# and align the two series to visualize the main
+# relative movements
+#
+
+  # lag the order data
+  mean_ind_orders <-
+    ind_orders %>%
+    # lag
+    mutate(Date = Date + ind_orders_offset) %>%
+    filter(Date > '2012-01-01' & Date < '2016-01-01')
+
+  # extract the order data
+  mean_ind_orders <- mean(mean_ind_orders[, "Orders"])
+  
+  # monthly raw_data (test_ccf)
+  mean_sales <- test_ccf %>%
+    filter(Date > '2012-01-01' & 
+             Date < '2016-01-01') %>%
+    as.data.frame()
+  
+  # extract the monthly sale data
+  mean_sales <- mean(mean_sales[, "monthly_sales"])
+  
+  # difference betwee the order and monthly sale data
+  mean_offset <- mean_ind_orders - mean_sales
+  
+  ind_orders %>%
+    mutate(Date = Date + ind_orders_offset) %>%
+    filter(Date > '2012-01-01' & 
+             Date < '2017-01-01') %>%
+    ggplot(aes(x = Date, y = Orders, 
+               color = "Equip. Orders")) +
+    geom_smooth(size = 0.5, 
+                se = FALSE,
+                span = 0.15) +
+    
+    # plot the monthly sale data
+    geom_smooth(data = test_ccf %>% 
+                filter(Date > '2012-01-01' & Date < '2017-01-01'), 
+                aes(x = Date, 
+                    y = monthly_sales + mean_offset,
+                    color = "Sales"),
+                se = FALSE,
+                span = 0.15) +
+    theme_bw() +
+    ylim(0, 1) +
+    scale_color_manual("",
+                       values = c("black", "red"),
+                       breaks = c("Equip. Orders", "Sales")) +
+    labs(x = "Date",
+         y = "Mfg. Equip. Orders / Sales (normalized)\n",
+         title = "Lagged Manufacturing Equipment Orders",
+         subtitle = "overlay on de-trended Monthly Sales") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(plot.subtitle = element_text(hjust = 0.5)) +
+    theme(legend.position = "right")
+#
+```
+
+
+# -------------------------------------------
+# load the prepared data
+# -------------------------------------------
+
+# plot the "daily"" tot_bookings_raw by regions  
+```{r Load Prepared Data, echo=FALSE, message=FALSE, warning=FALSE} 
+#
+# load the prepared data
+#
+  model_data <- read.csv('model_data.csv',
+                         header = TRUE,
+                         stringsAsFactors = FALSE) %>%
+  scale_0_to_1(scale_cols = which(colnames(.) != "date"))
+  print(colnames(model_data))
+  date_col <- which(colnames(model_data) == "date")
+  
+  colnames(model_data)[date_col] <- "data_date"
+
+  # bookings is the new column name
+  # data_date will be used as aggregation 
+  # tot_bookings_raw will be aggregated
+  # daily sales!!!!
+  plot_temp <- model_data %>%
+    dcast(data_date ~ "bookings", 
+          value.var = "tot_bookings_raw",
+          fun.aggregate = sum) %>%
+    mutate(data_date = as.Date(data_date, origin = '1899-12-30')) %>%
+    filter(data_date < '2016-01-01')
+  
+  # lagged
+  total_sales_plot <- plot_temp %>%
+    ggplot(aes(x = data_date + 365,
+               y = bookings)) +
+    geom_line() +
+    labs(x = "Sales Date", 
+         y = "Sales (normalized)\n",
+         title = "Total Sales") +
+    theme_bw() +
+    theme(legend.position = "right") +
+    theme(plot.title = element_text(hjust = 0.5, size = 12)) +
+    theme(legend.title = element_text(hjust = 0.5, size = 10)) +
+    theme(legend.text = element_text(size = 10))
+
+  # extract column names
+  regions <- which(colnames(model_data) %in%
+                     c("North", "NorthEast", "South", 
+                       "Mountain", "Key_Accounts", 
+                       "Other", "SouthEast", "SouthWest"))
+  
+  bookings <- 
+    which(substr(colnames(model_data), 1, 8) == "Bookings")
+  
+  pipelines <-
+    which(substr(colnames(model_data), 1, 8) == "Pipeline")
+  
+  plot_melt <- model_data[model_data[, regions[1]] == 1, c(date_col, bookings)] %>%
+    mutate(hist_bookings = rowSums((.)[, -date_col])) %>%
+    dcast(data_date ~ "bookings", 
+          value.var = "hist_bookings",
+          fun.aggregate = sum) %>%
+    mutate(data_date = as.Date(data_date, origin = '1899-12-30'))
+  
+  plot_melt <- cbind(plot_melt, 
+                     rep(colnames(model_data)[regions[1]], nrow(plot_melt)))
+  
+  colnames(plot_melt) <- c("Date", "bookings", "region")
+  
+  for (i in 2:length(regions)) {
+    plot_temp <- 
+      model_data[model_data[, regions[i]] == 1, 
+                 c(date_col, bookings)] %>%
+      mutate(hist_bookings = rowSums((.)[, -date_col])) %>%
+      dcast(data_date ~ "bookings", 
+            value.var = "hist_bookings",
+            fun.aggregate = sum) %>%
+      mutate(data_date = as.Date(data_date, origin = '1899-12-30'))
+    plot_temp <- 
+      cbind(plot_temp,
+            rep(colnames(model_data)[regions[i]],
+                nrow(plot_temp)))
+    colnames(plot_temp) <-
+      c("Date", "bookings", "region")
+    plot_melt <- rbind(plot_melt, plot_temp)
+  }
+  region_plot <- plot_melt %>%
+    ggplot(aes(x = Date,
+               y = bookings)) +
+    geom_line(aes(color = region, 
+                  linetype = region),
+                  size = 1) +
+    labs(x = "Sales Date", 
+         y = "Sales (normalized by Area)\n",
+         title = "Sales by Area") +
+    theme_bw() +
+    theme(legend.position = "right") +
+    theme(plot.title = element_text(hjust = 0.5, size = 12)) +
+    theme(legend.title = element_text(hjust = 0.5, size = 10)) +
+    theme(legend.text = element_text(size = 10))
+  print(region_plot)
+#  
+```
+
+
+
+
+```{r Replot only sig. Areas, echo=FALSE, message=FALSE, warning=FALSE}
+  exclude_areas <- c("Key_Accounts", "Other",
+                     "North", "South")
+  regions <- which(colnames(model_data) %in%
+                     c("NorthEast", "Mountain", 
+                       "SouthEast", "SouthWest"))
+  plot_melt <- 
+    model_data[model_data[, regions[1]] == 1, 
+                          c(date_col, bookings)] %>%
+    mutate(hist_bookings = rowSums((.)[, -date_col])) %>%
+    dcast(data_date ~ "bookings", 
+          value.var = "hist_bookings",
+          fun.aggregate = sum) %>%
+    mutate(data_date = as.Date(data_date, origin = '1899-12-30'))
+  plot_melt <-
+    cbind(plot_melt, 
+          rep(colnames(model_data)[regions[1]],
+              nrow(plot_melt)))
+  colnames(plot_melt) <-
+    c("Date", "bookings", "region")
+  for (i in 2:length(regions)) {
+    plot_temp <- 
+      model_data[model_data[, regions[i]] == 1, 
+                 c(date_col, bookings)] %>%
+      mutate(hist_bookings = rowSums((.)[, -date_col])) %>%
+      dcast(data_date ~ "bookings", 
+            value.var = "hist_bookings",
+            fun.aggregate = sum) %>%
+      mutate(data_date = as.Date(data_date, origin = '1899-12-30'))
+    plot_temp <- 
+      cbind(plot_temp,
+            rep(colnames(model_data)[regions[i]],
+                nrow(plot_temp)))
+    colnames(plot_temp) <-
+      c("Date", "bookings", "region")
+    plot_melt <- rbind(plot_melt, plot_temp)
+  }
+  
+  
+  region_plot <- 
+    plot_melt %>%
+    ggplot(aes(x = Date,
+               y = bookings)) +
+    geom_line(aes(color = region, 
+                  linetype = region),
+                  size = 1) +
+    labs(x = "Sales Date", 
+         y = "Sales (normalized by Area)\n",
+         title = "Sales by Area") +
+    theme_bw() +
+    theme(legend.position = "right") +
+    theme(plot.title = element_text(hjust = 0.5, size = 12)) +
+    theme(legend.title = element_text(hjust = 0.5, size = 10)) +
+    theme(legend.text = element_text(size = 10))
+  print(region_plot)
+
+```
+
+
+```{r Compare Areas to Total, echo=FALSE, message=FALSE, warning=FALSE, fig.width=9}
+  grid.arrange(region_plot + 
+                 theme(legend.position = c(0.1, 0.9)), 
+               total_sales_plot, 
+               ncol = 2)
+#  
+```
+
+# -------------------------------------------
+# Interpolation and lag and combine
+# -------------------------------------------
+
+```{r Blend External Data, echo=FALSE, message=FALSE, warning=FALSE}
+#
+# linear interpolation to daily granularity
+#
+  daily_ind_data <-
+    data.frame(Date = seq(as.Date('2011-12-31'),
+                          as.Date('2016-12-31'), 
+                          by = 1),
+               Orders = numeric(length = as.integer(as.Date('2016-12-31') - 
+                                         as.Date('2011-12-31') + 1)))
+
+  daily_ind_data <-
+    left_join(daily_ind_data, ind_orders, by = "Date") %>%
+    select(Date, Orders.y) %>%
+    rename(Orders = Orders.y)
+  
+  daily_ind_data <-
+    approx(daily_ind_data$Date, 
+           daily_ind_data$Orders, 
+           n = nrow(daily_ind_data)) %>%
+    as.data.frame() %>%
+    rename(Date = x, Orders = y) %>%
+    mutate(Date = as.Date(Date, origin = '1970-01-01')) %>%
+    filter(Date >= '2012-01-01' & Date <= '2016-12-31')
+#
+# we generate a plot not for the report but to allow
+# verification that the interpolation is working
+#
+  interpolated_ind_orders_plot <-
+    daily_ind_data %>%
+    ggplot(aes(x = Date, y = Orders)) +
+    geom_line(color = "dodgerblue") +
+    geom_point(data = 
+                 ind_orders %>%
+                 filter(!(is.na(Orders)) &
+                          Date >= '2012-01-01' &
+                          Date <= '2016-12-31'),
+               aes(x = Date,
+                   y = Orders), 
+               color = "red")
+#  
+  commodity <-
+    commodity %>%
+    rename(Date = date)
+  
+  daily_com_data <-
+    data.frame(Date = seq(as.Date('2011-12-30'),
+                          as.Date('2017-01-03'), 
+                          by = 1),
+               commodity_price = 
+                 numeric(length =
+                          as.integer(as.Date('2017-01-03') - 
+                                     as.Date('2011-12-30') + 1)))
+  
+  daily_com_data <-
+    left_join(daily_com_data, commodity, by = "Date") %>%
+    select(Date, commodity_price.y) %>%
+    rename(commodity_price = commodity_price.y)
+  
+  daily_com_data <-
+    approx(daily_com_data$Date, 
+           daily_com_data$commodity_price, 
+           n = nrow(daily_com_data)) %>%
+    as.data.frame() %>%
+    rename(Date = x, commodity_price = y) %>%
+    mutate(Date = as.Date(Date, origin = '1970-01-01')) %>%
+    filter(Date >= '2012-01-01' & Date <= '2016-12-31')
+#
+# filter excluded piplines
+#
+  exclude_pipelines <-
+    paste0("Pipeline_", exclude_pipelines)
+
+  #####################################
+  model_data <-
+    model_data %>%
+    select(-exclude_pipelines) %>%
+#
+# filter excluded regions
+#
+    select(-exclude_areas) %>%
+    mutate(Date = as.Date(data_date, 
+                          origin = '1899-12-30')) %>%
+    select(-data_date)
+#
+# lag series !!!!!!!!!!!!!!!!!!
+#
+  daily_ind_data[, "Date"] <-
+    daily_ind_data[, "Date"] + (ind_orders_offset - 365)
+  
+  daily_com_data[, "Date"] <-
+    daily_com_data[, "Date"] + (com_offset - 365)
+  
+  econ_index[, "Date"] <-
+    econ_index[, "Date"] + (econ_offset - 365)
+#
+# blend
+#
+  model_data <-
+    model_data %>%
+    left_join(daily_com_data, by = "Date") %>%
+    left_join(daily_ind_data, by = "Date") %>%
+    left_join(econ_index, by = "Date")
+#  
+```
+
+# time series !!!!!!!!!!
+```{r ARIMA, echo=FALSE, message=FALSE, warning=FALSE}
+begin_train_date <- '2012-01-01'
+end_train_date <- '2015-03-31'
+begin_val_date <- '2015-04-01' # only used in neural network section
+end_val_date <- '2015-06-30' # only used in neural network section
+begin_test_date <- '2015-07-01'
+end_test_date <- '2015-12-31'
+
+# filter the needed time range
+baseline_model_data <- 
+  model_data %>%
+  filter(Date <= end_test_date &
+           Date >= begin_train_date)
+
+# there might be some NA in the beginning, so we remove the date with NA
+if (!(length(nrow(baseline_model_data[is.na(baseline_model_data[, "Orders"]) |
+                                      is.na(baseline_model_data[, "index"]) |
+                                      is.na(baseline_model_data[, "commodity_price"]), 
+                                      ]))) == 0) {
+  begin_train_date <- 
+    max(baseline_model_data[is.na(baseline_model_data[, "Orders"]) |
+                              is.na(baseline_model_data[, "index"]) |
+                              is.na(baseline_model_data[, "commodity_price"]), 
+                            "Date"]) + 1
+}
+
+# filter again
+baseline_train_data <-
+  baseline_model_data %>%
+  filter(Date >= begin_train_date & Date <= end_val_date)
+
+a = model_data
+
+# aggregate the model_data
+aa = a %>%
+  group_by(Date) %>%
+  summarise(tot_sales = sum(tot_bookings_raw))
+
+xx = aa$tot_sales[!is.na(aa$tot_sales)]
+txx = ts(xx)
+
+# build arima model
+mm  = auto.arima(txx, seasonal = F, test = 'adf', ic = 'aic')
+
+# iteration to find best p and q
+bestfit = list(aic = mm$aic, p = 0, q = 0, fit = mm)
+for (i in 1:3) {
+  for (j in 1:3) {
+    
+    z1 = fourier(ts(xx, frequency = 1875), K = j)
+    z2 = fourier(ts(xx, frequency = 624), K = j)
+    
+    fit = auto.arima(txx, xreg = cbind(z1, z2), seasonal = F, test = 'adf', ic = 'aic')
+    
+    if(fit$aic < bestfit$aic){
+      bestfit = list(aic = fit$aic, p = i, q = j, fit = fit)
+      xreg = cbind(z1, z2)
+    }
+  }  
+}
+
+pp = forecast(bestfit$fit, xreg = xreg)
+
+
+# filtered model_data
+baseline_pred_data <- 
+  model_data %>%
+  filter(Date <= end_test_date & Date >= begin_train_date)
+
+# aggregate the filtered model_data
+baseline_results <-
+  model_data[, c("Date", "tot_bookings_raw")] %>%
+  # features have been lagged. tot_bookings_raw is one-year later than the features
+  # adding 365 so we can predict the future (test data)
+  
+  # date is corresponding to features
+  mutate(Date = Date + 365) %>%
+  filter(Date <= as.Date(end_test_date) + 365 & Date >= as.Date(begin_train_date) + 365) %>%
+  group_by(Date) %>%
+  summarise(bookings = sum(tot_bookings_raw)) %>%
+  
+  # prediction
+  cbind(pred = pp$mean[1:1433]) %>%
+  mutate(res = pred - bookings) %>%
+  as_tibble()
+
+#
+Train_pred <-
+  baseline_results %>%
+  filter(Date <= as.Date(end_train_date) + 365 &
+           Date >= as.Date(begin_train_date) + 365) %>%
+  summarize(train_pred = sum(pred),
+            train_act = sum(bookings)) %>%
+  mutate(Train_acc = 100 * (train_pred - train_act) /
+           train_act)
+#
+Val_pred <-
+  baseline_results %>%
+  filter(Date <= as.Date(end_val_date) + 365 &
+           Date >= as.Date(begin_val_date) + 365) %>%
+  summarize(val_pred = sum(pred),
+            val_act = sum(bookings)) %>%
+  mutate(Val_acc = 100 * (val_pred - val_act) /
+           val_act)
+#
+Test_pred <-
+  baseline_results %>%
+  filter(Date <= as.Date(end_test_date) + 365 &
+           Date >= as.Date(begin_test_date) + 365) %>%
+  summarize(test_pred = sum(pred),
+            test_act = sum(bookings)) %>%
+  mutate(test_acc = 100 * (test_pred - test_act)/
+           test_act)
+#
+RMSE_train <-
+  baseline_results %>%
+  filter(Date >= as.Date(begin_train_date) + 365 &
+           Date <= as.Date(end_train_date) + 365)
+RMSE_train <-
+  sqrt(sum(RMSE_train[, "res"]^2) / nrow(RMSE_train)) %>%
+  as.numeric()
+#
+baseline_train_hist <-
+  baseline_results %>%
+  filter(Date >= as.Date(begin_train_date) + 365 &
+           Date <= as.Date(end_val_date) + 365) %>%
+  ggplot(aes(x = res)) +
+  xlim(-1, 1) +
+  geom_histogram(fill = "dodgerblue", 
+                 alpha = 0.5, 
+                 color = "blue") +
+  theme_bw() +
+  labs(x = "Residuals from fit",
+       y = "Counts",
+       title = " ",
+       subtitle = "Training Data") +
+  theme(plot.title = element_text(hjust = 0.5,
+                                  size = 10)) +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+max_count <- 
+  max(ggplot_build(baseline_train_hist)[["data"]][[1]][["count"]])
+min_res <-
+  min(ggplot_build(baseline_train_hist)[["data"]][[1]][["x"]])
+baseline_train_hist <-
+  baseline_train_hist +
+  annotate("text",
+           x = -1,
+           y = max_count,
+           label = paste0("RMSE = ",
+                          round(RMSE_train, 3)),
+           hjust = 0,
+           size = 3) +
+  ylim(0, 1.05 * max_count)
+#
+RMSE_val <-
+  baseline_results %>%
+  filter(Date >= as.Date(begin_val_date) + 365 &
+           Date <= as.Date(end_val_date) + 365)
+RMSE_val <-
+  sqrt(sum(RMSE_val[, "res"]^2) / nrow(RMSE_val)) %>%
+  as.numeric()
+baseline_val_hist <-
+  baseline_results %>%
+  filter(Date >= as.Date(begin_val_date) + 365 &
+           Date <= as.Date(end_val_date) + 365) %>%
+  ggplot(aes(x = res)) +
+  xlim(-1, 1) +
+  ylim(0, 1.05 * max_count) +
+  geom_histogram(fill = "dodgerblue", 
+                 alpha = 0.5, 
+                 color = "blue") +
+  theme_bw() +
+  labs(x = "Residuals from prediction",
+       y = " ",
+       title = "Distribution of Residuals",
+       subtitle = "Validation Data") +
+  theme(plot.title = element_text(hjust = 0.5, 
+                                  size = 10)) +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+baseline_val_hist <-
+  baseline_val_hist +
+  annotate("text",
+           x = -1,
+           y = max_count,
+           label = paste0("RMSE = ",
+                          round(RMSE_val, 3)),
+           hjust = 0,
+           size = 3)
+#  
+RMSE_test <-
+  baseline_results %>%
+  filter(Date >= as.Date(begin_test_date) + 365 &
+           Date <= as.Date(end_test_date) + 365)
+RMSE_test <-
+  sqrt(sum(RMSE_test[, "res"]^2) / nrow(RMSE_test)) %>%
+  as.numeric()
+baseline_test_hist <-
+  baseline_results %>%
+  filter(Date >= as.Date(begin_test_date) + 365 &
+           Date <= as.Date(end_test_date) + 365) %>%
+  ggplot(aes(x = res)) +
+  xlim(-1, 1) +
+  ylim(0, 1.05 * max_count) +
+  geom_histogram(fill = "dodgerblue",
+                 alpha = 0.5, 
+                 color = "blue") +
+  theme_bw() +
+  labs(x = "Residuals from prediction",
+       y = " ",
+       title = " ",
+       subtitle = "Test Data") +
+  theme(plot.title = element_text(hjust = 0.5,
+                                  size = 10)) +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+baseline_test_hist <-
+  baseline_test_hist +
+  annotate("text",
+           x = -1,
+           y = max_count,
+           label = paste0("RMSE = ",
+                          round(RMSE_test, 3)),
+           hjust = 0,
+           size = 3)
+grid.arrange(baseline_train_hist,
+             baseline_val_hist,
+             baseline_test_hist,
+             ncol = 3)
+
+```
+
+```{r Baseline Model Plot, echo=FALSE, message=FALSE, warning=FALSE}
+  baseline_plot <-
+    baseline_results %>%
+    filter(Date <= as.Date(end_test_date) + 365) %>%
+    ggplot(aes(x = Date)) +
+    geom_line(aes(y = bookings), 
+              color = "red") +
+    geom_line(aes(y = pred), 
+              color = "dodgerblue") +
+    labs(x = "Prediction Date",
+         y = "Sales (normalized)",
+         title = "Fit model and predictions",
+         subtitle = "ARIMA") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(plot.subtitle = element_text(hjust = 0.5)) +
+    theme_bw()
+  print(baseline_plot)
+```
+
+# linear regression !!!!!!!!!
+```{r Modeling--Linear Baseline, echo=FALSE, message=FALSE, warning=FALSE}
+  begin_train_date <- '2012-01-01'
+  end_train_date <- '2015-03-31'
+  begin_val_date <- '2015-04-01' # only used in neural network section
+  end_val_date <- '2015-06-30' # only used in neural network section
+  begin_test_date <- '2015-07-01'
+  end_test_date <- '2015-12-31'
+
+  # filtered model_data
+  baseline_model_data <- 
+    model_data %>%
+    filter(Date <= end_test_date & Date >= begin_train_date)
+  
+  if (!(length(nrow(baseline_model_data[is.na(baseline_model_data[, "Orders"]) |
+                                      is.na(baseline_model_data[, "index"]) |
+                                      is.na(baseline_model_data[, "commodity_price"]), 
+                                      ]))) == 0) {
+    begin_train_date <- 
+      max(baseline_model_data[is.na(baseline_model_data[, "Orders"]) |
+                                is.na(baseline_model_data[, "index"]) |
+                                is.na(baseline_model_data[, "commodity_price"]), 
+                              "Date"]) + 1
+  }
+  
+  # filter again
+  baseline_train_data <- baseline_model_data %>%
+    filter(Date >= begin_train_date & Date <= end_val_date)
+  
+  # training (not daily)!!!
+  baseline_model <- lm(tot_bookings_raw ~ ., data = baseline_train_data)
+
+  
+# build a formula exclude low significance featues
+#
+  threshold <- 0.5
+  signif_form <- 
+    as.formula(paste("tot_bookings_raw ~ ",
+    paste(names(which((summary(baseline_model)$coefficients[
+                       2:(nrow(summary(baseline_model)$coefficients)), 4] < 
+                         threshold) == TRUE)), 
+                       collapse = "+")))
+  
+  baseline_model <- lm(signif_form, data = baseline_train_data)
+
+  # used for making prediction
+  baseline_pred_data <- model_data %>%
+    filter(Date <= as.Date(end_test_date) & Date >= as.Date(begin_train_date))
+  
+  baseline_results <-
+    model_data[, c("Date", "tot_bookings_raw")] %>%
+    mutate(Date = Date + 365) %>%
+    filter(Date <= as.Date(end_test_date) + 365 & Date >= as.Date(begin_train_date) + 365) %>%
+    # making prediction
+    cbind(baseline_pred = predict(baseline_model, newdata = baseline_pred_data)) %>%
+    
+    # aggregate
+    group_by(Date) %>%
+    summarize(bookings = sum(tot_bookings_raw),
+              pred = sum(baseline_pred)) %>%
+    
+    # prediction
+    mutate(pred = as.numeric(pred)) %>%
+    mutate(res = pred - bookings) %>%
+    as.data.frame()
+
+  # Extract training part
+  Train_pred <-
+    baseline_results %>%
+    filter(Date <= as.Date(end_train_date) + 365 &
+             Date >= as.Date(begin_train_date) + 365) %>%
+    summarize(train_pred = sum(pred),
+              train_act = sum(bookings)) %>%
+    mutate(Train_acc = 100 * (train_pred - train_act) /
+             train_act)
+
+  # Extract validation part
+  Val_pred <-
+    baseline_results %>%
+    filter(Date <= as.Date(end_val_date) + 365 &
+             Date >= as.Date(begin_val_date) + 365) %>%
+    summarize(val_pred = sum(pred),
+              val_act = sum(bookings)) %>%
+    mutate(Val_acc = 100 * (val_pred - val_act) /
+             val_act)
+
+  # Extract testing part
+  Test_pred <-
+    baseline_results %>%
+    filter(Date <= as.Date(end_test_date) + 365 &
+             Date >= as.Date(begin_test_date) + 365) %>%
+    summarize(test_pred = sum(pred),
+              test_act = sum(bookings)) %>%
+    mutate(test_acc = 100 * (test_pred - test_act)/
+             test_act)
+#
+  RMSE_train <-
+    baseline_results %>%
+    filter(Date >= as.Date(begin_train_date) + 365 &
+             Date <= as.Date(end_train_date) + 365)
+  RMSE_train <-
+    sqrt(sum(RMSE_train[, "res"]^2) / nrow(RMSE_train)) %>%
+    as.numeric()
+#
+  baseline_train_hist <-
+    baseline_results %>%
+    filter(Date >= as.Date(begin_train_date) + 365 &
+             Date <= as.Date(end_val_date) + 365) %>%
+    ggplot(aes(x = res)) +
+    xlim(-1, 1) +
+    geom_histogram(fill = "dodgerblue", 
+                   alpha = 0.5, 
+                   color = "blue") +
+    theme_bw() +
+    labs(x = "Residuals from fit",
+         y = "Counts",
+         title = " ",
+         subtitle = "Training Data") +
+    theme(plot.title = element_text(hjust = 0.5,
+                                    size = 10)) +
+    theme(plot.subtitle = element_text(hjust = 0.5))
+  max_count <- 
+    max(ggplot_build(baseline_train_hist)[["data"]][[1]][["count"]])
+  min_res <-
+    min(ggplot_build(baseline_train_hist)[["data"]][[1]][["x"]])
+  baseline_train_hist <-
+    baseline_train_hist +
+    annotate("text",
+             x = -1,
+             y = max_count,
+             label = paste0("RMSE = ",
+                            round(RMSE_train, 3)),
+             hjust = 0,
+             size = 3) +
+    ylim(0, 1.05 * max_count)
+#
+  RMSE_val <-
+    baseline_results %>%
+    filter(Date >= as.Date(begin_val_date) + 365 &
+             Date <= as.Date(end_val_date) + 365)
+  RMSE_val <-
+    sqrt(sum(RMSE_val[, "res"]^2) / nrow(RMSE_val)) %>%
+    as.numeric()
+  baseline_val_hist <-
+    baseline_results %>%
+    filter(Date >= as.Date(begin_val_date) + 365 &
+             Date <= as.Date(end_val_date) + 365) %>%
+    ggplot(aes(x = res)) +
+    xlim(-1, 1) +
+    ylim(0, 1.05 * max_count) +
+    geom_histogram(fill = "dodgerblue", 
+                   alpha = 0.5, 
+                   color = "blue") +
+    theme_bw() +
+    labs(x = "Residuals from prediction",
+         y = " ",
+         title = "Distribution of Residuals",
+         subtitle = "Validation Data") +
+    theme(plot.title = element_text(hjust = 0.5, 
+                                    size = 10)) +
+    theme(plot.subtitle = element_text(hjust = 0.5))
+  baseline_val_hist <-
+    baseline_val_hist +
+    annotate("text",
+             x = -1,
+             y = max_count,
+             label = paste0("RMSE = ",
+                            round(RMSE_val, 3)),
+             hjust = 0,
+             size = 3)
+#  
+  RMSE_test <-
+    baseline_results %>%
+    filter(Date >= as.Date(begin_test_date) + 365 &
+             Date <= as.Date(end_test_date) + 365)
+  RMSE_test <-
+    sqrt(sum(RMSE_test[, "res"]^2) / nrow(RMSE_test)) %>%
+    as.numeric()
+  baseline_test_hist <-
+    baseline_results %>%
+    filter(Date >= as.Date(begin_test_date) + 365 &
+             Date <= as.Date(end_test_date) + 365) %>%
+    ggplot(aes(x = res)) +
+    xlim(-1, 1) +
+    ylim(0, 1.05 * max_count) +
+    geom_histogram(fill = "dodgerblue",
+                   alpha = 0.5, 
+                   color = "blue") +
+    theme_bw() +
+    labs(x = "Residuals from prediction",
+         y = " ",
+         title = " ",
+         subtitle = "Test Data") +
+  theme(plot.title = element_text(hjust = 0.5,
+                                  size = 10)) +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+  baseline_test_hist <-
+    baseline_test_hist +
+    annotate("text",
+             x = -1,
+             y = max_count,
+             label = paste0("RMSE = ",
+                            round(RMSE_test, 3)),
+             hjust = 0,
+             size = 3)
+  grid.arrange(baseline_train_hist,
+               baseline_val_hist,
+               baseline_test_hist,
+               ncol = 3)
+#  
+```
+
+At this stage, the residuals from the fit are reasonably distributed, albeit with fairly large RMSE (and the R^2^ isn't great either!), and the residuals for the prediction intervals aren't terrible.  Plotting the prediction and actual sales together gives:
+
+```{r Baseline Model Plot, echo=FALSE, message=FALSE, warning=FALSE}
+  baseline_plot <-
+    baseline_results %>%
+    filter(Date <= as.Date(end_test_date) + 365) %>%
+    ggplot(aes(x = Date)) +
+    geom_line(aes(y = bookings), 
+              color = "red") +
+    geom_line(aes(y = pred), 
+              color = "dodgerblue") +
+    labs(x = "Prediction Date",
+         y = "Sales (normalized)",
+         title = "Fit model and predictions",
+         subtitle = "Linear Regression") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(plot.subtitle = element_text(hjust = 0.5)) +
+  theme_bw()
+  print(baseline_plot)
+```
+
+
+```{r Modeling--Robust Linear, echo=FALSE, results='hide',  message=FALSE, warning=FALSE}
+#
+# Robust Regression Control Parameters
+#  
+# 5-fold cross validation using 2 random repeats
+
+  val_control <- trainControl(method = "repeatedcv",
+                              number = 5,
+                              repeats = 2,
+                              verboseIter = TRUE)
+#
+# now evaluate lasso regression
+#
+  robust_baseline_model <- 
+    train(signif_form, 
+          data = baseline_train_data,
+          method = "glmnet",
+          tuneGrid = 
+            expand.grid(alpha = c(0.005, 0.01, 0.05),
+                        lambda = c(0.00005, 
+                                   0.0001, 0.0005)),
+          trControl = val_control)
+  robust_results <-
+    model_data[, c("Date", "tot_bookings_raw")] %>%
+    mutate(Date = Date + 365) %>%
+    filter(Date <= as.Date(end_test_date) + 365 &
+             Date >= as.Date(begin_train_date) + 365) %>%
+    cbind(robust_pred = predict(robust_baseline_model,
+          newdata = baseline_pred_data)) %>%
+    group_by(Date) %>%
+    summarize(bookings = sum(tot_bookings_raw),
+              pred = sum(robust_pred)) %>%
+    mutate(pred = as.numeric(pred)) %>%
+    mutate(res = pred - bookings) %>%
+    as.data.frame()
+#
+  Train_pred <-
+    robust_results %>%
+    filter(Date <= as.Date(end_train_date) + 365 &
+             Date >= as.Date(begin_train_date) + 365) %>%
+    summarize(train_pred = sum(pred),
+              train_act = sum(bookings)) %>%
+    mutate(Train_acc = 100 * (train_pred - train_act) /
+             train_act)
+#
+  Val_pred <-
+    robust_results %>%
+    filter(Date <= as.Date(end_val_date) + 365 &
+             Date >= as.Date(begin_val_date) + 365) %>%
+    summarize(val_pred = sum(pred),
+              val_act = sum(bookings)) %>%
+    mutate(Val_acc = 100 * (val_pred - val_act) /
+             val_act)
+#
+  Test_pred <-
+    robust_results %>%
+    filter(Date <= as.Date(end_test_date) + 365 &
+             Date >= as.Date(begin_test_date) + 365) %>%
+    summarize(test_pred = sum(pred),
+              test_act = sum(bookings)) %>%
+    mutate(test_acc = 100 * (test_pred - test_act)/
+             test_act)
+#
+  RMSE_train <-
+    robust_results %>%
+    filter(Date >= as.Date(begin_train_date) + 365 &
+             Date <= as.Date(end_train_date) + 365)
+  RMSE_train <-
+    sqrt(sum(RMSE_train[, "res"]^2) / nrow(RMSE_train)) %>%
+    as.numeric()
+#
+  robust_train_hist <-
+    robust_results %>%
+    filter(Date >= as.Date(begin_train_date) + 365 &
+             Date <= as.Date(end_val_date) + 365) %>%
+    ggplot(aes(x = res)) +
+    xlim(-1, 1) +
+    geom_histogram(fill = "dodgerblue", 
+                   alpha = 0.5, 
+                   color = "blue") +
+    theme_bw() +
+    labs(x = "Residuals from fit",
+         y = "Counts",
+         title = " ",
+         subtitle = "Training Data") +
+    theme(plot.title = element_text(hjust = 0.5,
+                                    size = 10)) +
+    theme(plot.subtitle = element_text(hjust = 0.5))
+  max_count <- 
+    max(ggplot_build(robust_train_hist)[["data"]][[1]][["count"]])
+  min_res <-
+    min(ggplot_build(robust_train_hist)[["data"]][[1]][["x"]])
+  robust_train_hist <-
+    robust_train_hist +
+    annotate("text",
+             x = -1,
+             y = max_count,
+             label = paste0("RMSE = ",
+                            round(RMSE_train, 3)),
+             hjust = 0,
+             size = 3) +
+    ylim(0, 1.05 * max_count)
+#
+  RMSE_val <-
+    robust_results %>%
+    filter(Date >= as.Date(begin_val_date) + 365 &
+             Date <= as.Date(end_val_date) + 365)
+  RMSE_val <-
+    sqrt(sum(RMSE_val[, "res"]^2) / nrow(RMSE_val)) %>%
+    as.numeric()
+  robust_val_hist <-
+    robust_results %>%
+    filter(Date >= as.Date(begin_val_date) + 365 &
+             Date <= as.Date(end_val_date) + 365) %>%
+    ggplot(aes(x = res)) +
+    xlim(-1, 1) +
+    ylim(0, 1.05 * max_count) +
+    geom_histogram(fill = "dodgerblue", 
+                   alpha = 0.5, 
+                   color = "blue") +
+    theme_bw() +
+    labs(x = "Residuals from prediction",
+         y = " ",
+         title = "Distribution of Residuals",
+         subtitle = "Validation Data") +
+    theme(plot.title = element_text(hjust = 0.5, 
+                                    size = 10)) +
+    theme(plot.subtitle = element_text(hjust = 0.5))
+  robust_val_hist <-
+    robust_val_hist +
+    annotate("text",
+             x = -1,
+             y = max_count,
+             label = paste0("RMSE = ",
+                            round(RMSE_val, 3)),
+             hjust = 0,
+             size = 3)
+#  
+  RMSE_test <-
+    robust_results %>%
+    filter(Date >= as.Date(begin_test_date) + 365 &
+             Date <= as.Date(end_test_date) + 365)
+  RMSE_test <-
+    sqrt(sum(RMSE_test[, "res"]^2) / nrow(RMSE_test)) %>%
+    as.numeric()
+  robust_test_hist <-
+    robust_results %>%
+    filter(Date >= as.Date(begin_test_date) + 365 &
+             Date <= as.Date(end_test_date) + 365) %>%
+    ggplot(aes(x = res)) +
+    xlim(-1, 1) +
+    ylim(0, 1.05 * max_count) +
+    geom_histogram(fill = "dodgerblue",
+                   alpha = 0.5, 
+                   color = "blue") +
+    theme_bw() +
+    labs(x = "Residuals from prediction",
+         y = " ",
+         title = " ",
+         subtitle = "Test Data") +
+    theme(plot.title = element_text(hjust = 0.5,
+                                    size = 10)) +
+    theme(plot.subtitle = element_text(hjust = 0.5))
+  robust_test_hist <-
+    robust_test_hist +
+    annotate("text",
+             x = -1,
+             y = max_count,
+             label = paste0("RMSE = ",
+                            round(RMSE_test, 3)),
+             hjust = 0,
+             size = 3)
+  grid.arrange(robust_train_hist,
+               robust_val_hist,
+               robust_test_hist,
+               ncol = 3)
+#
+```
+
+
+```{r Plot robust results, echo=FALSE, message=FALSE, warning=FALSE}
+  robust_plot <-
+    baseline_plot +
+    geom_line(data = robust_results %>%
+              filter(Date <= as.Date(end_test_date) + 365),
+                aes(y = pred), 
+              color = "black",
+              linetype = "dashed")
+  print(robust_plot)
+```
+
+
+
+# ------------------------------------
+# Neural Network
+# ------------------------------------
+
+# LSTM
+```{r, echo=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+
+seed <- 897313
+use_session_with_seed(seed, disable_gpu = FALSE,
+                      disable_parallel_cpu = FALSE)
+
+begin_train_date <- '2012-01-01'
+end_train_date <- '2015-03-31'
+begin_val_date <- '2015-04-01'
+end_val_date <- '2015-06-30'
+begin_test_date <- '2015-07-01'
+end_test_date <- '2015-12-31'
+#  
+full_data <- 
+  model_data %>%
+  filter(Date <= end_test_date &
+           Date >= begin_train_date)
+
+if (!(length(nrow(full_data[is.na(full_data[, "Orders"]) |
+                            is.na(full_data[, "index"]) |
+                            is.na(full_data[, "commodity_price"]), 
+                            ]))) == 0) {
+  begin_train_date <- 
+    max(full_data[is.na(full_data[, "Orders"]) |
+                    is.na(full_data[, "index"]) |
+                    is.na(full_data[, "commodity_price"]), 
+                  "Date"]) + 1
+}
+
+bookings_scale <- 
+  cbind(min = min(full_data[, "tot_bookings_raw"]),
+        max = max(full_data[, "tot_bookings_raw"])) %>% as_tibble()
+#    
+train_scales <- 
+  tibble(col = character(length = ncol(full_data)),
+         min = numeric(length = ncol(full_data)),
+         max = numeric(length = ncol(full_data)))
+
+for (i in 1:ncol(full_data)) {
+  train_scales[i, "col"] <- colnames(full_data)[i]
+  train_scales[i, "min"] <- min(full_data[, i])
+  train_scales[i, "max"] <- max(full_data[, i])
+}
+
+train_scales <- as.data.frame(train_scales)
+train_scale_cols <- which(train_scales[, "max"] > 1 | train_scales[, "min"] != 0)
+
+train_start <- 
+  min(which(full_data[, "Date"] == begin_train_date))
+
+train_end <-
+  max(which(full_data[, "Date"] == end_train_date))
+
+val_start <-
+  min(which(full_data[, "Date"] == (as.Date(begin_val_date))))
+
+val_end <-
+  max(which(full_data[, "Date"] == end_val_date))
+
+test_start <-
+  min(which(full_data[, "Date"] == (as.Date(begin_test_date))))
+
+test_end <-
+  max(which(full_data[, "Date"] == end_test_date))
+
+full_data <-
+  full_data %>% 
+  mutate(Date = as.integer(Date)) %>%
+  scale_0_to_1(scale_cols = train_scale_cols)
+#  
+x_train <-
+  full_data[train_start:train_end, ] %>%
+  select(-which(colnames(full_data) == 
+                  "tot_bookings_raw")) %>%
+  as.matrix()
+
+x_val <-
+  full_data[val_start:val_end, ] %>%
+  select(-which(colnames(full_data) == 
+                  "tot_bookings_raw")) %>%
+  as.matrix()
+
+x_test <-
+  full_data[test_start:test_end, ] %>%
+  select(-which(colnames(full_data) == 
+                  "tot_bookings_raw")) %>%
+  as.matrix()
+
+#  
+y_train <-
+  full_data[train_start:train_end, "tot_bookings_raw"] %>%
+  as.data.frame() %>%
+  scale_0_to_1(scale_cols = 1) %>%
+  as.matrix()
+
+y_val <-
+  full_data[val_start:val_end, "tot_bookings_raw"] %>%
+  as.data.frame() %>%
+  scale_0_to_1(scale_cols = 1) %>%
+  as.matrix()
+
+y_test <-
+  full_data[test_start:test_end, "tot_bookings_raw"] %>%
+  as.data.frame() %>%
+  scale_0_to_1(scale_cols = 1) %>%
+  as.matrix()
+
+timestep = 1
+
+x_train1 = array(data = x_train, dim = c(nrow(x_train), timestep, ncol(x_train)))
+y_train1 = array(data = y_train, dim = c(nrow(y_train), 1))
+x_val1 = array(data = x_val, dim = c(nrow(x_val), timestep, ncol(x_val)))
+y_val1 = array(data = y_val, dim = c(nrow(y_val), 1))
+x_pred = rbind(x_train, x_val, x_test) %>%
+  array(dim = c(nrow(x_test) + nrow(x_val) + nrow(x_train) , timestep, ncol(x_test)))
+
+nn_linear_model <- 
+  keras_model_sequential() %>%
+  layer_lstm(units = ncol(x_train), 
+             activation = "elu",
+             input_shape = c(timestep, ncol(x_train)),
+             return_sequences = T,
+             kernel_initializer = initializer_random_normal()) %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_lstm(units = ncol(x_train), 
+             return_sequences = T,
+             activation = "elu",  
+             kernel_initializer = initializer_random_normal()) %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_lstm(units = ncol(x_train), 
+             return_sequences = FALSE,
+             activation = "elu",  
+             kernel_initializer = initializer_random_normal()) %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 1, activation = "linear")
+
+nn_linear_model %>% 
+  compile(
+    optimizer = optimizer_adam(lr = 0.0005, decay = 0.00005),
+    loss = "mean_squared_error"
+  )
+
+tictoc::tic()
+history_train <- 
+  nn_linear_model %>% 
+  fit(
+    x_train1,
+    y_train1,
+    validation_data = list(x_val1, y_val1),
+    shuffle = FALSE,
+    view_metrics = FALSE,
+    epochs = 500,
+    batch_size = 30000,
+    verbose = 1
+  )
+tictoc::toc()
+
+nn_linear_results <- predict(nn_linear_model, x_pred) %>%
+  as_tibble() %>%
+  rename("pred_raw" = names(.)[1]) %>%
+  mutate(Date = baseline_pred_data$Date + 365) %>%
+  mutate(bookings_raw = baseline_pred_data$tot_bookings_raw) %>%
+  group_by(Date) %>%
+  summarize(bookings = sum(bookings_raw), 
+            pred = sum(pred_raw)) %>%
+  mutate(pred = pred * (bookings_scale$max - 
+                          bookings_scale$min) + 
+           bookings_scale$min) %>%
+  mutate(pred = as.numeric(pred)) %>%
+  mutate(res = pred - bookings) %>%
+  as_tibble()
+
+
+
+
+
+Train_pred <- nn_linear_results %>%
+  filter(Date <= as.Date(end_train_date) + 365 & Date >= as.Date(begin_train_date) + 365) %>%
+  summarize(train_pred = sum(pred), 
+            train_act = sum(bookings)) %>%
+  mutate(Train_acc = 100 * (train_pred - train_act) / train_act)
+#
+Val_pred <- nn_linear_results %>%
+  filter(Date <= as.Date(end_val_date) + 365 & Date >= as.Date(begin_val_date) + 365) %>%
+  summarize(val_pred = sum(pred), 
+            val_act = sum(bookings)) %>%
+  mutate(Val_acc = 100 * (val_pred - val_act) / val_act)
+#
+Test_pred <- nn_linear_results %>%
+  filter(Date <= as.Date(end_test_date) + 365 & Date >= as.Date(begin_test_date) + 365) %>%
+  summarize(test_pred = sum(pred), 
+            test_act = sum(bookings)) %>%
+  mutate(test_acc = 100 * (test_pred - test_act) / test_act)
+#
+RMSE_train <- nn_linear_results %>%
+  filter(Date >= as.Date(begin_train_date) + 365 & Date <= as.Date(end_train_date) + 365)
+
+RMSE_train <- sqrt(sum(RMSE_train[, "res"]^2) / nrow(RMSE_train)) %>%
+  as.numeric()
+
+nn_train_hist <- nn_linear_results %>%
+  filter(Date >= as.Date(begin_train_date) + 365 & Date <= as.Date(end_train_date) + 365) %>%
+  ggplot(aes(x = res)) +
+  xlim(-1, 1) +
+  geom_histogram(fill = "dodgerblue",
+                 alpha = 0.5, 
+                 color = "blue") +
+  theme_economist() +
+  labs(x = "Residuals from fit",
+       y = "Counts",
+       title = " ",
+       subtitle = "Training Data") +
+  theme(plot.title = element_text(hjust = 0.5, size = 10)) +
+  theme(plot.subtitle = element_text(hjust = 0.5))+
+  theme_bw()
+
+max_count <- max(ggplot_build(nn_train_hist)[["data"]][[1]][["count"]])
+min_res <- min(ggplot_build(nn_train_hist)[["data"]][[1]][["x"]])
+
+nn_train_hist <- nn_train_hist +
+  annotate("text",
+           x = -1,
+           y = max_count,
+           label = paste0("RMSE = ",
+                          round(RMSE_train, 3)),
+           hjust = 0,
+           size = 3) +
+  ylim(0, 1.05 * max_count)
+#  
+RMSE_val <-
+  nn_linear_results %>%
+  filter(Date >= as.Date(begin_val_date) + 365 &
+           Date <= as.Date(end_val_date) + 365)
+RMSE_val <-
+  sqrt(sum(RMSE_val[, "res"]^2) / nrow(RMSE_val)) %>%
+  as.numeric()
+nn_val_hist <-
+  nn_linear_results %>%
+  filter(Date >= as.Date(begin_val_date) + 365 &
+           Date <= as.Date(end_val_date) + 365) %>%
+  ggplot(aes(x = res)) +
+  xlim(-1, 1) +
+  ylim(0, 1.05 * max_count) +
+  geom_histogram(fill = "dodgerblue", 
+                 alpha = 0.5, 
+                 color = "blue") +
+  theme_economist() +
+  labs(x = "Residuals from prediction",
+       y = " ",
+       title = "Distribution of Residuals",
+       subtitle = "Validation Data") +
+  theme(plot.title = element_text(hjust = 0.5,
+                                  size = 10)) +
+  theme(plot.subtitle = element_text(hjust = 0.5)) +
+  theme_bw()
+
+nn_val_hist <-
+  nn_val_hist +
+  annotate("text",
+           x = -1,
+           y = max_count,
+           label = paste0("RMSE = ",
+                          round(RMSE_val, 3)),
+           hjust = 0,
+           size = 3)
+#
+RMSE_test <-
+  nn_linear_results %>%
+  filter(Date >= as.Date(begin_test_date) + 365 &
+           Date <= as.Date(end_test_date) + 365)
+RMSE_test <-
+  sqrt(sum(RMSE_test[, "res"]^2) / nrow(RMSE_test)) %>%
+  as.numeric()
+
+nn_test_hist <-
+  nn_linear_results %>%
+  filter(Date >= as.Date(begin_test_date) + 365 &
+           Date <= as.Date(end_test_date) + 365) %>%
+  ggplot(aes(x = res)) +
+  xlim(-1, 1) +
+  ylim(0, 1.05 * max_count) +
+  geom_histogram(fill = "dodgerblue",
+                 alpha = 0.5, 
+                 color = "blue") +
+  theme_economist() +
+  labs(x = "Residuals from prediction",
+       y = " ",
+       title = " ",
+       subtitle = "Test Data") +
+  theme(plot.title = element_text(hjust = 0.5,
+                                  size = 10)) +
+  theme(plot.subtitle = element_text(hjust = 0.5)) +
+  theme_bw()
+
+nn_test_hist <-
+  nn_test_hist +
+  annotate("text",
+           x = -1,
+           y = max_count,
+           label = paste0("RMSE = ",
+                          round(RMSE_test, 3)),
+           hjust = 0,
+           size = 3)
+grid.arrange(nn_train_hist,
+             nn_val_hist,
+             nn_test_hist,
+             ncol = 3)
+#  
+
+nn_plot <- 
+  nn_linear_results %>%
+  ggplot(aes(x = Date, y = pred)) +
+  geom_line(color = "dodgerblue") +
+  theme_economist() +
+  geom_line(data = baseline_results %>%
+              as.data.frame() %>%
+              filter(Date <= as.Date(end_test_date) + 365),
+            aes(x = Date, y = bookings), 
+            color = "red") +
+  labs(x = "Prediction Date",
+       y = "Sales (normalized)",
+       title = "Fit model and predictions",
+       subtitle = "LSTM") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(plot.subtitle = element_text(hjust = 0.5)) +
+  theme_bw()
+print(nn_plot)
+```
+
